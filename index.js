@@ -69,6 +69,22 @@ app.get("/equipment", async (req, res) => {
   }
 });
 
+app.get("/equipment/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const equipment = await equipmentCollection.findOne({
+      _id: new ObjectId(id),
+    });
+    if (!equipment) {
+      return res.status(404).json({ error: "Equipment not found" });
+    }
+    res.json(equipment);
+  } catch (err) {
+    console.error("Error fetching equipment", err);
+    res.status(500).json({ error: "Failed to fetch equipment" });
+  }
+});
+
 app.patch("/equipment/:id", async (req, res) => {
   try {
     const { id } = req.params;
