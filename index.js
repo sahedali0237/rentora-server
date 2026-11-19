@@ -95,7 +95,16 @@ app.get("/equipment/:id", async (req, res) => {
 app.patch("/equipment/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { ...updateData } = req.body;
+
+    const updateData = { ...req.body };
+
+    if (updateData.rentalPrice !== undefined) {
+      updateData.rentalPrice = Number(updateData.rentalPrice);
+    }
+
+    if (updateData.availableQuantity !== undefined) {
+      updateData.availableQuantity = Number(updateData.availableQuantity);
+    }
 
     const result = await equipmentCollection.updateOne(
       { _id: new ObjectId(id) },
@@ -103,13 +112,21 @@ app.patch("/equipment/:id", async (req, res) => {
     );
 
     if (result.matchedCount === 0) {
-      return res.status(404).json({ error: "Equipment not found" });
+      return res.status(404).json({
+        error: "Equipment not found",
+      });
     }
 
-    res.json(result);
+    res.json({
+      message: "Equipment updated successfully",
+      modifiedCount: result.modifiedCount,
+    });
   } catch (err) {
-    console.error("Error updating equipment", err);
-    res.status(500).json({ error: "Failed to update equipment" });
+    console.error("Error updating equipment:", err);
+
+    res.status(500).json({
+      error: "Failed to update equipment",
+    });
   }
 });
 
