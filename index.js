@@ -130,6 +130,33 @@ app.patch("/equipment/:id", async (req, res) => {
   }
 });
 
+app.delete("/equipment/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await equipmentCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        error: "Equipment not found",
+      });
+    }
+
+    res.json({
+      message: "Equipment deleted successfully",
+      deletedCount: result.deletedCount,
+    });
+  } catch (err) {
+    console.error("Error deleting equipment:", err);
+
+    res.status(500).json({
+      error: "Failed to delete equipment",
+    });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server initialized on port ${port}`);
 });
