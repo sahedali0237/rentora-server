@@ -9,17 +9,19 @@ const app = express();
 
 app.use(
   cors({
-    origin: "*",
+    origin: process.env.ORIGIN,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
   }),
 );
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 const port = process.env.PORT || 5000;
 
 const client = new MongoClient(process.env.MONGODB_URI);
 const db = client.db("Rentora-site");
 const userCollection = db.collection("user");
+const equipmentCollection = db.collection("equipment");
 
 export async function connectToMongoDB() {
   try {
@@ -44,6 +46,17 @@ app.get("/users", async (req, res) => {
   } catch (err) {
     console.error("Error fetching users", err);
     res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+
+app.post("/add-equipment", async (req, res) => {
+  try {
+    const newEquipment = req.body;
+    const result = await equipmentCollection.insertOne(newEquipment);
+    res.status(201).json(result);
+  } catch (err) {
+    console.error("Error adding equipment", err);
+    res.status(500).json({ error: "Failed to add equipment" });
   }
 });
 
