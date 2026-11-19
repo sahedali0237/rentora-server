@@ -61,11 +61,18 @@ app.post("/add-equipment", async (req, res) => {
 });
 app.get("/equipment", async (req, res) => {
   try {
-    const equipment = await equipmentCollection.find().toArray();
-    res.json(equipment);
-  } catch (err) {
-    console.error("Error fetching equipment", err);
-    res.status(500).json({ error: "Failed to fetch equipment" });
+    const query = { status: "Approved" };
+    if (req.query.search) {
+      query.title = { $regex: req.query.search, $options: "i" };
+    }
+    if (req.query.category) {
+      query.category = req.query.category;
+    }
+
+    const items = await equipmentCollection.find(query).toArray();
+    res.json(items);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch equipment" });
   }
 });
 
