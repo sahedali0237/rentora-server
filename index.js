@@ -59,6 +59,15 @@ app.post("/add-equipment", async (req, res) => {
     res.status(500).json({ error: "Failed to add equipment" });
   }
 });
+app.get("/equipment", async (req, res) => {
+  try {
+    const equipment = await equipmentCollection.find().toArray();
+    res.json(equipment);
+  } catch (err) {
+    console.error("Error fetching equipment", err);
+    res.status(500).json({ error: "Failed to fetch equipment" });
+  }
+});
 
 app.listen(port, () => {
   console.log(`Server initialized on port ${port}`);
