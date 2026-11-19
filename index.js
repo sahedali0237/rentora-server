@@ -22,6 +22,7 @@ const client = new MongoClient(process.env.MONGODB_URI);
 const db = client.db("Rentora-site");
 const userCollection = db.collection("user");
 const equipmentCollection = db.collection("equipment");
+const bookingCollection = db.collection("bookings");
 
 export async function connectToMongoDB() {
   try {
@@ -157,6 +158,44 @@ app.delete("/equipment/:id", async (req, res) => {
   }
 });
 
+app.get("/bookings", async (req, res) => {
+  try {
+    const { email } = req.query;
+
+    if (!email) {
+      return res.status(400).json({
+        error: "Email is required",
+      });
+    }
+
+    // Find user by email
+    const user = await usersCollection.findOne({
+      email: email,
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        error: "User not found",
+      });
+    }
+
+    // Find bookings using user's ID
+    const bookings = await bookingCollection
+      .find({
+        renterId: user._id.toString(),
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(bookings);
+  } catch (err) {
+    console.error("Error fetching bookings:", err);
+
+    res.status(500).json({
+      error: "Failed to fetch bookings",
+    });
+  }
+});
 app.listen(port, () => {
   console.log(`Server initialized on port ${port}`);
 });
