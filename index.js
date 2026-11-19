@@ -69,6 +69,27 @@ app.get("/equipment", async (req, res) => {
   }
 });
 
+app.patch("/equipment/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { ...updateData } = req.body;
+
+    const result = await equipmentCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateData },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ error: "Equipment not found" });
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error("Error updating equipment", err);
+    res.status(500).json({ error: "Failed to update equipment" });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server initialized on port ${port}`);
 });
