@@ -406,6 +406,26 @@ app.patch("/reviews/:id", async (req, res) => {
   }
 });
 
+app.delete("/reviews/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Example using Mongoose:
+    const deletedReview = await Review.findByIdAndDelete(id);
+
+    if (!deletedReview) {
+      return res.status(404).json({ message: "Review not found" });
+    }
+
+    return res
+      .status(200)
+      .json({ message: "Review deleted successfully", deletedReview });
+  } catch (error) {
+    console.error("Error deleting review:", error);
+    return res.status(500).json({ message: "Failed to delete review" });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server initialized on port ${port}`);
 });
