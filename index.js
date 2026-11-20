@@ -324,6 +324,88 @@ app.get("/reviews", async (req, res) => {
     res.status(500).json({ message: "Failed to fetch reviews" });
   }
 });
+
+app.patch("/reviews/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rating, comment, email } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid review ID" });
+    }
+
+    if (rating === undefined && comment === undefined) {
+      return res.status(400).json({ message: "Nothing to update" });
+    }
+
+    const existingReview = await reviewsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!existingReview) {
+      return res.status(404).json({ message: "Review not found" });
+    }
+
+    // Optional ownership check if email is sent from the client
+    if (
+      email &&
+      existingReview.userEmail !== email &&
+      existingReview.email !== email
+    ) {
+      return res
+        .status(403)
+        .json({ message: "You can only edit your own reviews" });
+    }
+
+    const updateFields = {
+      updatedAt: new Date(),
+    };
+
+    if (rating !== undefined) {
+      const numericRating = Number(rating);
+      if (
+        Number.isNaN(numericRating) ||
+        numericRating < 1 ||
+        numericRating > 5
+      ) {
+        return res
+          .status(400)
+          .json({ message: "Rating must be between 1 and 5" });
+      }
+      updateFields.rating = numericRating;
+    }
+
+    if (comment !== undefined) {
+      const trimmedComment = String(comment).trim();
+      if (!trimmedComment) {
+        return res.status(400).json({ message: "Comment cannot be empty" });
+      }
+      updateFields.comment = trimmedComment;
+    }
+
+    const result = await reviewsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateFields },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: "Review not found" });
+    }
+
+    const updatedReview = await reviewsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    res.status(200).json({
+      message: "Review updated successfully",
+      review: updatedReview,
+    });
+  } catch (error) {
+    console.error("Error updating review:", error);
+    res.status(500).json({ message: "Failed to update review" });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server initialized on port ${port}`);
 });
