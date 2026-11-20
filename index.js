@@ -23,6 +23,7 @@ const db = client.db("Rentora-site");
 const userCollection = db.collection("user");
 const equipmentCollection = db.collection("equipment");
 const bookingCollection = db.collection("bookings");
+const reviewsCollection = db.collection("reviews");
 
 export async function connectToMongoDB() {
   try {
@@ -196,6 +197,110 @@ app.get("/bookings", async (req, res) => {
     });
   }
 });
+
+app.post("/reviews", async (req, res) => {
+  try {
+    const {
+      equipmentId,
+      bookingId,
+      renterEmail,
+      renterName,
+      renterImage,
+      rating,
+      comment,
+    } = req.body;
+
+    // Basic validation
+    if (!equipmentId || !bookingId || !renterEmail || !rating) {
+      return res.status(400).send({
+        success: false,
+        message: "Required information is missing.",
+      });
+    }
+
+    const numericRating = Number(rating);
+
+    if (
+      numericRating < 1 ||
+      numericRating > 5 ||
+      !Number.isInteger(numericRating)
+    ) {
+      return res.status(400).send({
+        success: false,
+        message: "Rating must be between 1 and 5.",
+      });
+    }
+
+    // Check booking
+    const booking = await bookingsCollection.findOne({
+      _id: new ObjectId(bookingId),
+    });
+
+    if (!booking) {
+      return res.status(404).send({
+        success: false,
+        message: "Booking not found.",
+      });
+    }
+
+    // Make sure this booking belongs to the renter
+    if (booking.renterEmail !== renterEmail) {
+      return res.status(403).send({
+        success: false,
+        message: "You cannot review this booking.",
+      });
+    }
+
+    // Only completed bookings can be reviewed
+    if (booking.status !== "completed") {
+      return res.status(400).send({
+        success: false,
+        message: "You can only review completed rentals.",
+      });
+    }
+
+    // Prevent duplicate review
+    const existingReview = await reviewsCollection.findOne({
+      bookingId: new ObjectId(bookingId),
+      renterEmail,
+    });
+
+    if (existingReview) {
+      return res.status(409).send({
+        success: false,
+        message: "You have already reviewed this rental.",
+      });
+    }
+
+    // Create review
+    const review = {
+      equipmentId: new ObjectId(equipmentId),
+      bookingId: new ObjectId(bookingId),
+      renterEmail,
+      renterName: renterName || "Anonymous",
+      renterImage: renterImage || "",
+      rating: numericRating,
+      comment: comment?.trim() || "",
+      createdAt: new Date(),
+    };
+
+    const result = await reviewsCollection.insertOne(review);
+
+    res.status(201).send({
+      success: true,
+      message: "Review submitted successfully.",
+      reviewId: result.insertedId,
+    });
+  } catch (error) {
+    console.error("Create review error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to create review.",
+    });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server initialized on port ${port}`);
 });
