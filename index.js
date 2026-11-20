@@ -301,6 +301,29 @@ app.post("/reviews", async (req, res) => {
   }
 });
 
+app.get("/reviews", async (req, res) => {
+  try {
+    const { email, userId } = req.query;
+
+    const query = {};
+    if (email) {
+      // Match whichever field name your review documents use (e.g., userEmail or email)
+      query.$or = [{ userEmail: email }, { email: email }];
+    } else if (userId) {
+      query.userId = userId;
+    }
+
+    const reviews = await reviewsCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).json(reviews);
+  } catch (error) {
+    console.error("Error fetching reviews:", error);
+    res.status(500).json({ message: "Failed to fetch reviews" });
+  }
+});
 app.listen(port, () => {
   console.log(`Server initialized on port ${port}`);
 });
