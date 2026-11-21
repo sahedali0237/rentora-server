@@ -54,10 +54,21 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
+// Idempotency support: sparse unique indexes on `idempotencyKey` for the
+// equipment and bookings collections. sparse + unique means documents that
+// don't have the field never collide, so legacy data is unaffected.
+async function ensureIndexes() {
+  await Promise.all([
+    equipmentCollection.createIndex({ idempotencyKey: 1 }, { unique: true, sparse: true }),
+    bookingCollection.createIndex({ idempotencyKey: 1 }, { unique: true, sparse: true }),
+  ]);
+}
+
 export async function connectToMongoDB() {
   try {
     await client.connect();
     console.log("You successfully connected to MongoDB!");
+    await ensureIndexes();
     return client;
   } catch (err) {
     console.error("Failed to connect to MongoDB", err);
@@ -82,9 +93,31 @@ app.get("/users", requireAuth, async (req, res) => {
 
 app.post("/add-equipment", requireAuth, async (req, res) => {
   try {
-    const newEquipment = req.body;
-    const result = await equipmentCollection.insertOne(newEquipment);
-    res.status(201).json(result);
+    // Idempotency: the client may send an `Idempotency-Key` header so that
+    // retries of the same create request don't produce duplicate documents.
+    const idempotencyKey = req.headers["idempotency-key"] || undefined;
+
+    const newEquipment = { ...req.body };
+    if (idempotencyKey) {
+      newEquipment.idempotencyKey = idempotencyKey;
+    }
+
+    try {
+      const result = await equipmentCollection.insertOne(newEquipment);
+      res.status(201).json(result);
+    } catch (err) {
+      // Duplicate idempotency key: a retry already created this equipment.
+      // Return the existing document with 200 so the retry is safe.
+      if (err.code === 11000) {
+        const existing = await equipmentCollection.findOne({
+          idempotencyKey,
+        });
+        if (existing) {
+          return res.status(200).json(existing);
+        }
+      }
+      throw err;
+    }
   } catch (err) {
     console.error("Error adding equipment", err);
     res.status(500).json({ error: "Failed to add equipment" });
@@ -301,6 +334,12 @@ app.post("/bookings", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "Invalid equipment ID" });
     }
 
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    if (!start.getTime() || !end.getTime() || end < start) {
+      return res.status(400).json({ error: "Invalid rental dates" });
+    }
+
     // Look up the equipment so we never trust the client for price or owner.
     const equipment = await equipmentCollection.findOne({
       _id: new ObjectId(equipmentId),
@@ -309,11 +348,38 @@ app.post("/bookings", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "Equipment not found" });
     }
 
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    if (!start.getTime() || !end.getTime() || end < start) {
-      return res.status(400).json({ error: "Invalid rental dates" });
+    // Idempotency: a client-supplied `Idempotency-Key` header makes retries
+    // of the same booking request safe. If one was sent, check it first and
+    // return the existing booking instead of creating a duplicate.
+    const idempotencyKey = req.headers["idempotency-key"] || undefined;
+    if (idempotencyKey) {
+      const existingBooking = await bookingCollection.findOne({
+        idempotencyKey,
+      });
+      if (existingBooking) {
+        return res.status(200).json({
+          message: "Booking already exists for this idempotency key",
+          booking: existingBooking,
+        });
+      }
     }
+
+    // Reject bookings that overlap an existing pending/confirmed/active
+    // booking for the same equipment:
+    //   existing.startDate < newEnd AND existing.endDate > newStart
+    const overlapping = await bookingCollection.findOne({
+      equipmentId: new ObjectId(equipmentId),
+      status: { $in: ["pending", "confirmed", "active"] },
+      startDate: { $lt: end },
+      endDate: { $gt: start },
+    });
+    if (overlapping) {
+      return res.status(409).json({
+        error: "Equipment is already booked for the selected dates",
+        booking: overlapping,
+      });
+    }
+
     // Inclusive day count: renting start through end counts both days.
     const days = Math.round((end - start) / 86400000) + 1;
 
@@ -346,8 +412,30 @@ app.post("/bookings", requireAuth, async (req, res) => {
       createdAt: now,
       updatedAt: now,
     };
+    if (idempotencyKey) {
+      newBooking.idempotencyKey = idempotencyKey;
+    }
 
-    const result = await bookingCollection.insertOne(newBooking);
+    let result;
+    try {
+      result = await bookingCollection.insertOne(newBooking);
+    } catch (err) {
+      // A concurrent request may have inserted the same key between the
+      // check above and this insert. Fall back to returning the existing
+      // document instead of failing.
+      if (err.code === 11000 && idempotencyKey) {
+        const existing = await bookingCollection.findOne({
+          idempotencyKey,
+        });
+        if (existing) {
+          return res.status(200).json({
+            message: "Booking already exists for this idempotency key",
+            booking: existing,
+          });
+        }
+      }
+      throw err;
+    }
 
     res.status(201).json({
       message: "Booking created successfully",
@@ -427,26 +515,31 @@ app.post("/bookings/:id/pay", requireAuth, async (req, res) => {
         .json({ error: "Stripe is not configured on the server" });
     }
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      line_items: [
-        {
-          price_data: {
-            currency: "usd",
-            unit_amount: amountCents,
-            product_data: {
-              name: `Booking ${booking._id}`,
+    const idempotencyKey = req.headers["idempotency-key"] || booking._id.toString();
+
+    const session = await stripe.checkout.sessions.create(
+      {
+        mode: "payment",
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              unit_amount: amountCents,
+              product_data: {
+                name: `Booking ${booking._id}`,
+              },
             },
+            quantity: 1,
           },
-          quantity: 1,
+        ],
+        metadata: {
+          bookingId: booking._id.toString(),
         },
-      ],
-      metadata: {
-        bookingId: booking._id.toString(),
+        success_url: `${process.env.CLIENT_URL}/bookings/${booking._id}?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${process.env.CLIENT_URL}/dashboard/my-rentals`,
       },
-      success_url: `${process.env.CLIENT_URL}/bookings/${booking._id}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}/dashboard/my-rentals`,
-    });
+      { idempotencyKey },
+    );
 
     res.json({ url: session.url });
   } catch (err) {
