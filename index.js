@@ -70,7 +70,7 @@ app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-app.get("/users", async (req, res) => {
+app.get("/users", requireAuth, async (req, res) => {
   try {
     const users = await userCollection.find().toArray();
     res.json(users);
@@ -80,7 +80,7 @@ app.get("/users", async (req, res) => {
   }
 });
 
-app.post("/add-equipment", async (req, res) => {
+app.post("/add-equipment", requireAuth, async (req, res) => {
   try {
     const newEquipment = req.body;
     const result = await equipmentCollection.insertOne(newEquipment);
@@ -123,7 +123,7 @@ app.get("/equipment/:id", async (req, res) => {
   }
 });
 
-app.patch("/equipment/:id", async (req, res) => {
+app.patch("/equipment/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -161,7 +161,7 @@ app.patch("/equipment/:id", async (req, res) => {
   }
 });
 
-app.delete("/equipment/:id", async (req, res) => {
+app.delete("/equipment/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -188,7 +188,7 @@ app.delete("/equipment/:id", async (req, res) => {
   }
 });
 
-app.get("/bookings", async (req, res) => {
+app.get("/bookings", requireAuth, async (req, res) => {
   try {
     const { email } = req.query;
 
@@ -592,7 +592,7 @@ app.patch("/bookings/:id/cancel", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/reviews", async (req, res) => {
+app.post("/reviews", requireAuth, async (req, res) => {
   try {
     const {
       equipmentId,
@@ -719,7 +719,7 @@ app.get("/reviews", async (req, res) => {
   }
 });
 
-app.patch("/reviews/:id", async (req, res) => {
+app.patch("/reviews/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { rating, comment, email } = req.body;
@@ -800,7 +800,7 @@ app.patch("/reviews/:id", async (req, res) => {
   }
 });
 
-app.delete("/reviews/:id", async (req, res) => {
+app.delete("/reviews/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
 
