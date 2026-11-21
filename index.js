@@ -4,6 +4,7 @@ import express from "express";
 import cors from "cors";
 
 import { MongoClient, ObjectId } from "mongodb";
+import Stripe from "stripe";
 
 const app = express();
 
@@ -18,12 +19,40 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 const port = process.env.PORT || 5000;
 
+async function requireAuth(req, res, next) {
+  try {
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : authHeader;
+
+    if (!token) {
+      return res.status(401).json({ error: "Missing authentication token" });
+    }
+
+    const user = await userCollection.findOne({ email: token });
+    if (!user) {
+      return res.status(401).json({ error: "Invalid authentication token" });
+    }
+
+    req.user = user;
+    next();
+  } catch (err) {
+    console.error("Error during auth check:", err);
+    res.status(500).json({ error: "Failed to authenticate" });
+  }
+}
+
 const client = new MongoClient(process.env.MONGODB_URI);
 const db = client.db("Rentora-site");
 const userCollection = db.collection("user");
 const equipmentCollection = db.collection("equipment");
 const bookingCollection = db.collection("bookings");
 const reviewsCollection = db.collection("reviews");
+
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
 
 export async function connectToMongoDB() {
   try {
@@ -170,7 +199,7 @@ app.get("/bookings", async (req, res) => {
     }
 
     // Find user by email
-    const user = await usersCollection.findOne({
+    const user = await userCollection.findOne({
       email: email,
     });
 
@@ -188,6 +217,13 @@ app.get("/bookings", async (req, res) => {
       .sort({ createdAt: -1 })
       .toArray();
 
+    // Ensure every booking returns its status/paymentStatus for the renter view,
+    // defaulting legacy documents that predate these fields.
+    for (const booking of bookings) {
+      if (!booking.status) booking.status = "pending";
+      if (!booking.paymentStatus) booking.paymentStatus = "unpaid";
+    }
+
     res.status(200).json(bookings);
   } catch (err) {
     console.error("Error fetching bookings:", err);
@@ -195,6 +231,329 @@ app.get("/bookings", async (req, res) => {
     res.status(500).json({
       error: "Failed to fetch bookings",
     });
+  }
+});
+
+app.post("/bookings", requireAuth, async (req, res) => {
+  try {
+    const { equipmentId, startDate, endDate } = req.body;
+
+    if (!equipmentId || !startDate || !endDate) {
+      return res.status(400).json({
+        error: "equipmentId, startDate and endDate are required",
+      });
+    }
+
+    if (!ObjectId.isValid(equipmentId)) {
+      return res.status(400).json({ error: "Invalid equipment ID" });
+    }
+
+    // Look up the equipment so we never trust the client for price or owner.
+    const equipment = await equipmentCollection.findOne({
+      _id: new ObjectId(equipmentId),
+    });
+    if (!equipment) {
+      return res.status(404).json({ error: "Equipment not found" });
+    }
+
+    // Compute total from the equipment's rental price and the rental dates.
+    const price = Number(equipment.rentalPrice || 0);
+    if (!Number.isFinite(price) || price <= 0) {
+      return res
+        .status(400)
+        .json({ error: "Equipment has no valid rental price" });
+    }
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    if (!start.getTime() || !end.getTime() || end < start) {
+      return res.status(400).json({ error: "Invalid rental dates" });
+    }
+    // Inclusive day count: renting start through end counts both days.
+    const days = Math.round((end - start) / 86400000) + 1;
+    const total = price * days;
+
+    // Reject if a non-cancelled booking for the same equipment overlaps these dates.
+    const overlapping = await bookingCollection.findOne({
+      equipmentId: new ObjectId(equipmentId),
+      status: { $ne: "cancelled" },
+      startDate: { $lte: end },
+      endDate: { $gte: start },
+    });
+    if (overlapping) {
+      return res
+        .status(409)
+        .json({ error: "Booking dates overlap with an existing booking" });
+    }
+
+    const now = new Date();
+    const newBooking = {
+      equipmentId: new ObjectId(equipmentId),
+      renterId: req.user._id.toString(),
+      ownerId: equipment.ownerId,
+      total,
+      startDate: start,
+      endDate: end,
+      // Booking model defaults: pending / unpaid.
+      status: "pending",
+      paymentStatus: "unpaid",
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const result = await bookingCollection.insertOne(newBooking);
+
+    res.status(201).json({
+      message: "Booking created successfully",
+      booking: { ...newBooking, _id: result.insertedId },
+    });
+  } catch (err) {
+    console.error("Error creating booking:", err);
+    res.status(500).json({ error: "Failed to create booking" });
+  }
+});
+
+// Owner view of their equipment's bookings.
+app.get("/bookings/owner", requireAuth, async (req, res) => {
+  try {
+    const bookings = await bookingCollection
+      .find({
+        ownerId: req.user._id.toString(),
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    // Ensure every booking returns its status/paymentStatus for the owner view.
+    for (const booking of bookings) {
+      if (!booking.status) booking.status = "pending";
+      if (!booking.paymentStatus) booking.paymentStatus = "unpaid";
+    }
+
+    res.status(200).json(bookings);
+  } catch (err) {
+    console.error("Error fetching owner bookings:", err);
+
+    res.status(500).json({
+      error: "Failed to fetch owner bookings",
+    });
+  }
+});
+
+// Create a Stripe Checkout Session so the renter can pay their own booking.
+app.post("/bookings/:id/pay", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid booking ID" });
+    }
+
+    const booking = await bookingCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    // Renter can only pay their own booking.
+    if (booking.renterId !== req.user._id.toString()) {
+      return res
+        .status(403)
+        .json({ error: "You can only pay for your own bookings" });
+    }
+
+    // Only allow payment when unpaid and not cancelled.
+    if (booking.paymentStatus !== "unpaid" || booking.status === "cancelled") {
+      return res.status(400).json({
+        error: "This booking is not available for payment",
+      });
+    }
+
+    const amountCents = Math.round(Number(booking.total) * 100);
+    if (!Number.isFinite(amountCents) || amountCents <= 0) {
+      return res.status(400).json({ error: "Invalid booking total" });
+    }
+
+    if (!stripe) {
+      return res
+        .status(503)
+        .json({ error: "Stripe is not configured on the server" });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            unit_amount: amountCents,
+            product_data: {
+              name: `Booking ${booking._id}`,
+            },
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        bookingId: booking._id.toString(),
+      },
+      success_url: `${process.env.CLIENT_URL}/bookings/${booking._id}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/dashboard/my-rentals`,
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("Error creating checkout session:", err);
+    res.status(500).json({ error: "Failed to create payment session" });
+  }
+});
+
+app.post("/bookings/:id/verify-payment", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid booking ID" });
+    }
+
+    const { sessionId } = req.body || {};
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+
+    const booking = await bookingCollection.findOne({
+      _id: new ObjectId(id),
+    });
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    // Only the renter can verify their own booking.
+    if (booking.renterId !== req.user._id.toString()) {
+      return res
+        .status(403)
+        .json({ error: "You can only verify your own bookings" });
+    }
+
+    if (!stripe) {
+      return res
+        .status(503)
+        .json({ error: "Stripe is not configured on the server" });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (
+      session.metadata?.bookingId !== booking._id.toString() ||
+      session.payment_status !== "paid"
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Payment is not valid for this booking" });
+    }
+
+    // Idempotent: only transition bookings still marked unpaid and not
+    // cancelled, so calling this twice is harmless. All status values are
+    // lowercase in this codebase.
+    const result = await bookingCollection.updateOne(
+      {
+        _id: booking._id,
+        paymentStatus: "unpaid",
+        status: { $ne: "cancelled" },
+      },
+      {
+        $set: {
+          paymentStatus: "paid",
+          status: "confirmed",
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    // Nothing matched: either already paid/confirmed, cancelled, or otherwise
+    // no longer payable. Refund and surface a conflict when it isn't already paid.
+    if (result.matchedCount === 0 && booking.paymentStatus !== "paid") {
+      // Booking was cancelled or otherwise no longer payable; refund the payment.
+      if (session.payment_intent) {
+        try {
+          await stripe.refunds.create({
+            payment_intent: session.payment_intent,
+          });
+        } catch (refundErr) {
+          console.error("Refund failed:", refundErr);
+        }
+      }
+      return res
+        .status(409)
+        .json({ error: "Booking was cancelled. Your payment was refunded." });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Error verifying payment:", err);
+    res.status(500).json({ error: "Failed to verify payment" });
+  }
+});
+
+app.patch("/bookings/:id/cancel", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid booking ID" });
+    }
+
+    const booking = await bookingCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    // Only the equipment owner can cancel.
+    const equipment = await equipmentCollection.findOne({
+      _id: new ObjectId(booking.equipmentId),
+    });
+
+    if (!equipment || equipment.ownerId !== req.user._id.toString()) {
+      return res.status(403).json({
+        error: "Only the equipment owner can cancel this booking",
+      });
+    }
+
+    if (booking.paymentStatus === "paid") {
+      return res
+        .status(400)
+        .json({ error: "Paid bookings can't be cancelled" });
+    }
+
+    if (booking.status === "cancelled") {
+      return res.status(400).json({ error: "Booking is already cancelled" });
+    }
+
+    const result = await bookingCollection.updateOne(
+      {
+        _id: booking._id,
+        paymentStatus: "unpaid",
+        status: { $ne: "cancelled" },
+      },
+      { $set: { status: "cancelled", updatedAt: new Date() } },
+    );
+
+    if (result.matchedCount === 0) {
+      return res
+        .status(409)
+        .json({ error: "Booking was just paid or already cancelled" });
+    }
+
+    res.json({
+      message: "Booking cancelled successfully",
+      bookingId: booking._id.toString(),
+    });
+  } catch (err) {
+    console.error("Error cancelling booking:", err);
+    res.status(500).json({ error: "Failed to cancel booking" });
   }
 });
 
