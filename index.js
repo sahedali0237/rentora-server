@@ -234,6 +234,59 @@ app.get("/bookings", async (req, res) => {
   }
 });
 
+// Renter's own bookings, with equipment details populated for display.
+app.get("/bookings/my-rentals", requireAuth, async (req, res) => {
+  try {
+    const renterId = req.user._id.toString();
+    const bookings = await bookingCollection
+      .find({ renterId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    // Fetch equipment details for each booking so the renter view gets the
+    // equipment title, name, image(s) and daily rate alongside the booking.
+    const equipmentIds = [
+      ...new Set(bookings.map((b) => b.equipmentId?.toString()).filter(Boolean)),
+    ];
+    const equipmentById = new Map();
+    if (equipmentIds.length > 0) {
+      const equipment = await equipmentCollection
+        .find({ _id: { $in: equipmentIds.map((id) => new ObjectId(id)) } })
+        .project({
+          _id: 1,
+          title: 1,
+          name: 1,
+          image: 1,
+          images: 1,
+          rentalPrice: 1,
+          price: 1,
+          pricePerDay: 1,
+        })
+        .toArray();
+      for (const doc of equipment) {
+        equipmentById.set(doc._id.toString(), doc);
+      }
+    }
+
+    for (const booking of bookings) {
+      const equipmentDoc = booking.equipmentId
+        ? equipmentById.get(booking.equipmentId.toString())
+        : undefined;
+      booking.equipment = equipmentDoc || null;
+      if (!booking.status) booking.status = "pending";
+      if (!booking.paymentStatus) booking.paymentStatus = "unpaid";
+    }
+
+    res.status(200).json(bookings);
+  } catch (err) {
+    console.error("Error fetching renter bookings:", err);
+
+    res.status(500).json({
+      error: "Failed to fetch bookings",
+    });
+  }
+});
+
 app.post("/bookings", requireAuth, async (req, res) => {
   try {
     const { equipmentId, startDate, endDate } = req.body;
@@ -256,13 +309,6 @@ app.post("/bookings", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "Equipment not found" });
     }
 
-    // Compute total from the equipment's rental price and the rental dates.
-    const price = Number(equipment.rentalPrice || 0);
-    if (!Number.isFinite(price) || price <= 0) {
-      return res
-        .status(400)
-        .json({ error: "Equipment has no valid rental price" });
-    }
     const start = new Date(startDate);
     const end = new Date(endDate);
     if (!start.getTime() || !end.getTime() || end < start) {
@@ -270,29 +316,30 @@ app.post("/bookings", requireAuth, async (req, res) => {
     }
     // Inclusive day count: renting start through end counts both days.
     const days = Math.round((end - start) / 86400000) + 1;
+
+    // Price is read from the equipment document, never from the client body.
+    // Legacy equipment docs store the daily rate as `rentalPrice`; newer ones
+    // may use `pricePerDay`/`price`.
+    const price =
+      Number(equipment.rentalPrice ?? equipment.pricePerDay ?? equipment.price) || 0;
+    if (!Number.isFinite(price) || price <= 0) {
+      return res
+        .status(400)
+        .json({ error: "Equipment has no valid daily rate" });
+    }
     const total = price * days;
 
-    // Reject if a non-cancelled booking for the same equipment overlaps these dates.
-    const overlapping = await bookingCollection.findOne({
-      equipmentId: new ObjectId(equipmentId),
-      status: { $ne: "cancelled" },
-      startDate: { $lte: end },
-      endDate: { $gte: start },
-    });
-    if (overlapping) {
-      return res
-        .status(409)
-        .json({ error: "Booking dates overlap with an existing booking" });
-    }
-
     const now = new Date();
+    // Also write `amount` (the field legacy reader code and the UI read) so
+    // every new booking is consistent with the existing documents.
     const newBooking = {
       equipmentId: new ObjectId(equipmentId),
       renterId: req.user._id.toString(),
-      ownerId: equipment.ownerId,
-      total,
       startDate: start,
       endDate: end,
+      quantity: req.body.quantity,
+      totalPrice: total,
+      amount: total,
       // Booking model defaults: pending / unpaid.
       status: "pending",
       paymentStatus: "unpaid",
@@ -369,7 +416,7 @@ app.post("/bookings/:id/pay", requireAuth, async (req, res) => {
       });
     }
 
-    const amountCents = Math.round(Number(booking.total) * 100);
+    const amountCents = Math.round(Number(booking.totalPrice ?? booking.total) * 100);
     if (!Number.isFinite(amountCents) || amountCents <= 0) {
       return res.status(400).json({ error: "Invalid booking total" });
     }
@@ -511,41 +558,29 @@ app.patch("/bookings/:id/cancel", requireAuth, async (req, res) => {
       return res.status(404).json({ error: "Booking not found" });
     }
 
-    // Only the equipment owner can cancel.
-    const equipment = await equipmentCollection.findOne({
-      _id: new ObjectId(booking.equipmentId),
-    });
+    // Only the renter can cancel, and only while unpaid and not already
+    // confirmed beyond pending (paid or cancelled).
+    if (booking.renterId !== req.user._id.toString()) {
+      return res
+        .status(403)
+        .json({ error: "You can only cancel your own bookings" });
+    }
 
-    if (!equipment || equipment.ownerId !== req.user._id.toString()) {
-      return res.status(403).json({
-        error: "Only the equipment owner can cancel this booking",
+    if (
+      booking.paymentStatus === "paid" ||
+      booking.status !== "pending"
+    ) {
+      return res.status(400).json({
+        error: "This booking can't be cancelled",
       });
     }
 
-    if (booking.paymentStatus === "paid") {
-      return res
-        .status(400)
-        .json({ error: "Paid bookings can't be cancelled" });
-    }
-
-    if (booking.status === "cancelled") {
-      return res.status(400).json({ error: "Booking is already cancelled" });
-    }
-
-    const result = await bookingCollection.updateOne(
-      {
-        _id: booking._id,
-        paymentStatus: "unpaid",
-        status: { $ne: "cancelled" },
-      },
-      { $set: { status: "cancelled", updatedAt: new Date() } },
+    booking.status = "cancelled";
+    booking.updatedAt = new Date();
+    await bookingCollection.updateOne(
+      { _id: booking._id },
+      { $set: booking },
     );
-
-    if (result.matchedCount === 0) {
-      return res
-        .status(409)
-        .json({ error: "Booking was just paid or already cancelled" });
-    }
 
     res.json({
       message: "Booking cancelled successfully",
