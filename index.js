@@ -59,8 +59,14 @@ const stripe = process.env.STRIPE_SECRET_KEY
 // don't have the field never collide, so legacy data is unaffected.
 async function ensureIndexes() {
   await Promise.all([
-    equipmentCollection.createIndex({ idempotencyKey: 1 }, { unique: true, sparse: true }),
-    bookingCollection.createIndex({ idempotencyKey: 1 }, { unique: true, sparse: true }),
+    equipmentCollection.createIndex(
+      { idempotencyKey: 1 },
+      { unique: true, sparse: true },
+    ),
+    bookingCollection.createIndex(
+      { idempotencyKey: 1 },
+      { unique: true, sparse: true },
+    ),
   ]);
 }
 
@@ -279,7 +285,9 @@ app.get("/bookings/my-rentals", requireAuth, async (req, res) => {
     // Fetch equipment details for each booking so the renter view gets the
     // equipment title, name, image(s) and daily rate alongside the booking.
     const equipmentIds = [
-      ...new Set(bookings.map((b) => b.equipmentId?.toString()).filter(Boolean)),
+      ...new Set(
+        bookings.map((b) => b.equipmentId?.toString()).filter(Boolean),
+      ),
     ];
     const equipmentById = new Map();
     if (equipmentIds.length > 0) {
@@ -387,7 +395,9 @@ app.post("/bookings", requireAuth, async (req, res) => {
     // Legacy equipment docs store the daily rate as `rentalPrice`; newer ones
     // may use `pricePerDay`/`price`.
     const price =
-      Number(equipment.rentalPrice ?? equipment.pricePerDay ?? equipment.price) || 0;
+      Number(
+        equipment.rentalPrice ?? equipment.pricePerDay ?? equipment.price,
+      ) || 0;
     if (!Number.isFinite(price) || price <= 0) {
       return res
         .status(400)
@@ -504,7 +514,9 @@ app.post("/bookings/:id/pay", requireAuth, async (req, res) => {
       });
     }
 
-    const amountCents = Math.round(Number(booking.totalPrice ?? booking.total) * 100);
+    const amountCents = Math.round(
+      Number(booking.totalPrice ?? booking.total) * 100,
+    );
     if (!Number.isFinite(amountCents) || amountCents <= 0) {
       return res.status(400).json({ error: "Invalid booking total" });
     }
@@ -515,7 +527,8 @@ app.post("/bookings/:id/pay", requireAuth, async (req, res) => {
         .json({ error: "Stripe is not configured on the server" });
     }
 
-    const idempotencyKey = req.headers["idempotency-key"] || booking._id.toString();
+    const idempotencyKey =
+      req.headers["idempotency-key"] || booking._id.toString();
 
     const session = await stripe.checkout.sessions.create(
       {
@@ -659,10 +672,7 @@ app.patch("/bookings/:id/cancel", requireAuth, async (req, res) => {
         .json({ error: "You can only cancel your own bookings" });
     }
 
-    if (
-      booking.paymentStatus === "paid" ||
-      booking.status !== "pending"
-    ) {
+    if (booking.paymentStatus === "paid" || booking.status !== "pending") {
       return res.status(400).json({
         error: "This booking can't be cancelled",
       });
@@ -670,10 +680,7 @@ app.patch("/bookings/:id/cancel", requireAuth, async (req, res) => {
 
     booking.status = "cancelled";
     booking.updatedAt = new Date();
-    await bookingCollection.updateOne(
-      { _id: booking._id },
-      { $set: booking },
-    );
+    await bookingCollection.updateOne({ _id: booking._id }, { $set: booking });
 
     res.json({
       message: "Booking cancelled successfully",
@@ -910,6 +917,56 @@ app.delete("/reviews/:id", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("Error deleting review:", error);
     return res.status(500).json({ message: "Failed to delete review" });
+  }
+});
+
+// Admin dashboard statistics: real counts and revenue from the database.
+// Protected with the existing requireAuth middleware (this codebase has no
+// separate admin middleware, so we reuse the same auth pattern; nothing is
+// weakened or removed).
+app.get("/admin/stats", requireAuth, async (req, res) => {
+  try {
+    // 1. Total registered users (users collection).
+    const totalUsers = await userCollection.countDocuments({});
+
+    // 2. Total equipment/listings (equipment collection).
+    const totalEquipment = await equipmentCollection.countDocuments({});
+
+    // 3. Equipment awaiting admin approval. Uses the existing `status` field;
+    // only items whose status is "pending" are counted. Nothing is hardcoded
+    // and we do not assume every item is pending (case-insensitive to tolerate
+    // the mixed casing seen elsewhere in the data).
+    const pendingApprovals = await equipmentCollection.countDocuments({
+      status: { $regex: /^pending$/i },
+    });
+
+    // 4. Revenue from successfully paid rentals. Only bookings whose
+    // paymentStatus indicates "paid" are included (case-insensitive, since
+    // existing data mixes "Paid"/"paid"). Cancelled, rejected and pending
+    // rentals are excluded. The amount is read from the existing `totalPrice`
+    // field (falling back to `amount`); invalid/missing values are skipped.
+    const paidBookings = await bookingCollection
+      .find({ paymentStatus: { $regex: /^paid$/i } })
+      .project({ totalPrice: 1, amount: 1 })
+      .toArray();
+
+    let totalRevenue = 0;
+    for (const booking of paidBookings) {
+      const value = Number(booking.totalPrice ?? booking.amount ?? 0);
+      if (Number.isFinite(value) && value > 0) {
+        totalRevenue += value;
+      }
+    }
+
+    res.json({
+      totalUsers,
+      totalEquipment,
+      pendingApprovals,
+      totalRevenue,
+    });
+  } catch (err) {
+    console.error("Error calculating admin stats:", err);
+    res.status(500).json({ error: "Failed to calculate statistics" });
   }
 });
 
